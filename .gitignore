@@ -1,0 +1,27 @@
+# --- 虚拟环境 ---
+.venv/
+venv/
+
+# --- 模型/数据集缓存（HF_HOME，几个 GB，别进仓库）---
+hf-cache/
+
+# --- 脚本产物 ---
+# week1/day2/00_prepare_data.py 现拉现生成（flickr30k 子集，第三方图片）
+week1/day2/data/
+# Trainer 的 output_dir
+week1/day2/out_tiny/
+week1/day2/out_2b/
+out_*/
+*.log
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# --- 编辑器 / 系统 ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
