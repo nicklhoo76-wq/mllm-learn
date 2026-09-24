@@ -232,6 +232,9 @@ hidden state 早被 vision tower 的图像特征替换掉了，`lm_head` 在那�
 所以朴素方案的危害不是"数字好看但学得少"，是**方向直接错**：80% 的监督信号
 在逼模型从图像位置吐出占位符，梯度会去破坏图文对齐本身。
 
+> 当天只记到这一层。为什么 hidden state 会"被替换"、梯度具体往哪拽，
+> 见后面[补充：图像 token 为什么不能算 loss](#补充图像-token-为什么不能算-loss09-23-补)。
+
 一条样本的 token 预算（448 长边的图，`max_pixels=256*28*28`）：
 
 ```
@@ -424,6 +427,93 @@ RuntimeError: Dataset scripts are no longer supported, but found flickr30k.py
   否则图像特征填不进 `<|image_pad|>` 的位置。
 - mrope：`mrope_section` 之和必须等于 `head_dim / 2`。
   真模型 1536/12=128，一半 64，`[16,24,24]`；迷你版 256/4=64，一半 32，`[8,12,12]`。
+
+### 补充：图像 token 为什么不能算 loss（09-23 补）
+
+关键收获 1 只记到"lm_head 不会把概率给 151655"就停了，这句话本身还是个现象。
+回头把它拆到机制层面，分四步。
+
+**第一步：把"算它的 loss"翻译成具体要求。**
+
+先看一条真实样本摊开的样子（`02_labels.py` 第 2 节现在会直接打出来）：
+
+```
+image span = [15, 190]，共 176 个   grid_thw=[1,32,22]  ->  32*22/(2*2) = 176
+
+ pos |  input_id | token              |  label  | 本位 logits 的目标 = label[i+1]
+  14 |    151652 | '<|vision_start|>' |    -100 | -100 忽略
+  15 |    151655 | '<|image_pad|>'    |    -100 | -100 忽略
+ ...
+ 190 |    151655 | '<|image_pad|>'    |    -100 | -100 忽略
+ 191 |    151653 | '<|vision_end|>'   |    -100 | -100 忽略
+ ...
+ 203 |       198 | 'Ċ'                |    -100 | 11613 'Two'     <- 这一位算 loss
+ 204 |     11613 | 'Two'              |   11613 | 3908 'Ġyoung'
+```
+
+因为 loss shift 一位，"监督 pos=102"的字面意思是：**在第 88 个图像 patch 的位置上，
+让 lm_head 在全词表上把概率全押给 id 151655**。
+人话：「看完这半张图，请预测下一个 token 是……另一个图像占位符。」
+
+**第二步：这 176 个占位符是 processor 铺的，不是模型的输出空间。**
+
+`32*22/4 = 176`，只取决于 `max_pixels` 和图的长宽比，跟图里画了什么完全无关。
+推理时它由 processor 预先铺好，模型从 pos=204 才开始生成，永远不会吐出 151655。
+拿它当标签 = 训练一个**不会被调用**的行为，而且"标准答案"随 `max_pixels` 变。
+
+**第三步：占位符的 embedding 在前向里直接被覆盖 —— 这是猜反的根源。**
+
+transformers 5.4.0，`models/qwen2_vl/modeling_qwen2_vl.py` 约 1256-1264：
+
+```python
+inputs_embeds = self.get_input_embeddings()(input_ids)
+#   -> image 段拿到 embedding 表里 151655 那一行，176 行一模一样
+image_embeds  = self.get_image_features(pixel_values, image_grid_thw).pooler_output
+inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+#   -> 这 176 行被整体覆盖
+```
+
+`embedding[151655]` 活了不到一层就被扔了。**id 151655 的唯一作用是给 masked_scatter
+提供一个布尔索引** —— 它是"图像特征贴在这儿"的坐标标记，不承载内容。
+
+所以当天那个猜测错在哪：以为一长串相同 token 是"复读任务"。复读的前提是模型能从
+hidden state 里看出"我在图像区里"，**但它看不出来** —— 那些位置的 embedding 已经被
+覆盖，里面只有图像内容，没有"我是 image_pad"这个信息。这不是复读，是一道没见过的题。
+实测 loss 19.2 换算回概率（CE = -ln p）就是 `exp(-19.2) ≈ 4e-9`：预训练从没让它
+往这个 id 上放过概率。
+
+**第四步：梯度方向是反的。**
+
+图像位置的 hidden state `h` 携带"这块像素是什么"，预训练已经把它对齐到语义空间 ——
+lm_head 在这里吐出跟图像内容相关的词分布，**这就是"图文对齐"的定义**。
+而 lm_head 的第 151655 行在预训练里只当过负样本，被持续推离一切真实语义方向。强行加 CE：
+
+```
+dL/dh = (softmax(logits) - onehot(151655)) @ W_out
+```
+
+梯度把 `h` 往 `lm_head[151655]` 那一行拽 —— 把"这块像素是什么"的表示往"我是个占位符"
+的方向拽。而 `h` 是从 vision tower + merger 传上来的，只要视觉侧没冻，一路回传，
+**直接破坏视觉特征本身**。这就是"方向直接错"的确切含义。
+
+**反过来：掩掉 prompt 会不会掐断图文的梯度通路？不会。**
+
+看上面 pos=203：它的 label 是 -100，但它的 logits 配的是 label[204]。
+"读完整段 prompt（含 176 个视觉 token）之后开口说第一个词"这个监督**完整保留**。
+图像通过注意力影响 pos≥204 的每个 hidden state，梯度照样流回 vision tower
+（关键收获 2 的梯度范数实测）。**不算 loss ≠ 不参与训练**：图像是条件，不是目标。
+
+**判据**（以后任何 token 都能套）：
+
+> 推理时这个 token 是模型自己吐出来的，还是外部喂进去的？
+
+| | 角色 | labels |
+|---|---|---|
+| system prompt / user 问题 / 图像占位符 / padding | 条件（given） | `-100` |
+| answer / `<\|im_end\|>` | 目标（predict） | 真实 id |
+
+`<|image_pad|>` 100% 是外部喂的，没有讨论余地。这条判据顺带也解释了 prompt 段
+为什么要掩 —— 和图像 token 是同一个理由，不是两件事。
 
 ### 明日计划
 

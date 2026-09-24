@@ -7,20 +7,25 @@
 模型统一用 **Qwen2-VL-2B-Instruct**，硬件是**纯 CPU**（fp32），所以每个实验都刻意做小：
 几十条样本、几步训练、拧小分辨率 —— 拿到的是真实数字，不是玩具数字。
 
-三类文件各司其职：
+四类文件各司其职：
 
 | 文件 | 作用 |
 |---|---|
 | [`MLLMToolchainLearningPlan.md`](MLLMToolchainLearningPlan.md) | 4 周的总计划（写在前面，会随实测调整） |
-| [`notes.md`](notes.md) | **主要产出**。每天的关键收获、踩的坑、实测数字 |
+| [`notes.md`](notes.md) | **日志**。每天的关键收获、踩的坑、实测数字，按时间排 |
+| [`concepts.md`](concepts.md) | **知识**。把散在各天的结论接成主线，按链路排 |
 | `week1/dayN/*.py` | 可复现的实验脚本，笔记里每条结论都能在这里跑出来 |
+
+`notes.md` 和 `concepts.md` 是同一批内容的两种切法：日志保留当时的猜测和猜错（包括猜反的），
+主线只留接得上的那条线。想知道「当时怎么想的」看前者，想知道「这事到底怎么回事」看后者。
 
 ## 目录结构
 
 ```
 mllm-learn/
 ├── MLLMToolchainLearningPlan.md
-├── notes.md
+├── notes.md                   # 按天的日志
+├── concepts.md                # 按链路的主线
 ├── hf-cache/                  # HF_HOME，模型/数据集缓存（已 gitignore，约 4GB）
 ├── .venv/                     # 虚拟环境（已 gitignore）
 └── week1/
@@ -111,7 +116,7 @@ HF_HUB_OFFLINE=1 ./.venv/Scripts/python.exe -u week1/day2/04_train_2b.py
 | Week 3 | DeepSpeed 进阶 / TRL / vLLM | 待开始 | |
 | Week 4 | VLMEvalKit / lmms-eval / 综合实战 | 待开始 | |
 
-已经拿到的几个结论（细节和实测数字都在笔记里）：
+已经拿到的几个结论（完整推导见 [`concepts.md`](concepts.md)，原始记录见 [`notes.md`](notes.md)）：
 
 - **序列长度基本由图片决定，文字是零头。** 448x448 的图 = 256 个 visual token，
   占整个序列的 91%。OOM 或推理慢，第一个该拧的是分辨率，不是 batch size。

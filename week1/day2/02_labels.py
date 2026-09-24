@@ -139,13 +139,74 @@ n_sup = int((labels[0] != IGNORE_INDEX).sum())
 print(f"  总长度        {n_total:4d}")
 print(f"  其中 visual   {n_visual:4d}  ({n_visual / n_total:.0%})")
 print(f"  其中被监督    {n_sup:4d}  ({n_sup / n_total:.0%})")
+
+
+# --- 把 image 段前后的 token 布局逐位打出来 ---
+# "图像 token 不算 loss" 这句话，只有摊开成具体的 (input_id, label, 预测目标)
+# 三元组才看得清在说什么。下面这张表是后面所有讨论的依据。
+img_pos = (ids[0] == IMAGE_PAD_ID).nonzero().flatten()
+s, e = int(img_pos[0]), int(img_pos[-1])
+first_ans = int((labels[0] != IGNORE_INDEX).nonzero()[0])
+_t, _h, _w = out["image_grid_thw"][0].tolist()
+
+
+def _tk(i):
+    return repr(tok.convert_ids_to_tokens(int(i)))[:22]
+
+
+def _row(i):
+    # loss 是 shift 一位的：本位的 logits 负责预测 label[i+1]（见第 5 节实测）
+    tgt = int(labels[0][i + 1]) if i + 1 < n_total else None
+    tgt_s = (
+        "(末尾)" if tgt is None
+        else "-100 忽略" if tgt == IGNORE_INDEX
+        else f"{tgt} {_tk(tgt)}"
+    )
+    print(f"  {i:4d} | {int(ids[0][i]):9d} | {_tk(ids[0][i]):22s} "
+          f"| {int(labels[0][i]):7d} | {tgt_s}")
+
+
+print("\n--- 样本 #0 的 token 布局 ---")
+print(f"  image span = [{s}, {e}]，共 {len(img_pos)} 个"
+      f"   grid_thw={[_t, _h, _w]}  ->  {_h}*{_w}/(2*2) = {_h * _w // 4}")
+print("   pos |  input_id | token                  |  label  | 本位 logits 的目标 = label[i+1]")
+print("  " + "-" * 90)
+for i in range(s - 2, s + 2):
+    _row(i)
+print("   ... |    ...    | ...                    |   ...   | ...")
+for i in range(e - 1, e + 3):
+    _row(i)
+print("   ... |    ...    | ...                    |   ...   | ...")
+for i in range(first_ans - 2, first_ans + 3):
+    _row(i)
+
+_mid = (s + e) // 2
 print(f"""
-  回答 Day 1 留的问题：**图像的 {n_visual} 个 token 不算 loss**。
+  回答 Day 1 留的问题：**图像的 {n_visual} 个 token 不算 loss**，
   它们落在 prompt 段里，已经被 -100 掩掉了。
 
-  理由不是"省算力"，是"没意义"：让模型去预测下一个 token 还是不是 <|image_pad|>，
-  是个白送的任务 —— 占位符是 processor 按 grid 铺出来的，位置完全确定。
-  把它算进 loss 只会稀释真正的监督信号。
+  先把"算它的 loss"翻译成一句具体的要求。因为 loss shift 一位，监督 pos={_mid}
+  的字面意思是：**在第 {_mid - s + 1} 个图像 patch 的位置上，让 lm_head 在全词表上
+  把概率全押给 id {IMAGE_PAD_ID}**。人话：「看完这半张图，请预测下一个 token
+  是……另一个图像占位符。」
+
+  这个要求荒谬在三处：
+
+  (a) 标准答案与图像内容无关，只跟分辨率有关。
+      这 {len(img_pos)} 个占位符是 **processor 铺出来的**：grid {_h}x{_w}，merge_size=2，
+      {_h}*{_w}/4 = {_h * _w // 4}。同一张图，max_pixels 改一下标签序列就全变。
+      模型在学一道"数数题"，而这个数推理时是外部给定的。
+
+  (b) 推理时这条路径根本不存在。
+      generate 时 image_pad 由 processor 预先铺好，模型从 pos={first_ans} 往后生成，
+      永远不会、也不该吐出 {IMAGE_PAD_ID}。这是在训一个不会被调用的行为。
+
+  (c) 最要命的：梯度方向是反的。—— 这条需要看 forward 内部，放在第 4 节讲。
+
+  顺带注意表里 pos={first_ans - 1} 那行：它的 label 是 -100，但它的 logits 配的是
+  label[{first_ans}]（答案第一个词）。所以「读完整段 prompt（含 {n_visual} 个视觉 token）
+  之后开口说第一个词」这个监督是**保留着**的。掩 prompt 不会掐断图文之间的梯度通路，
+  第 5 节和 03 脚本的梯度范数实测都能印证。
 """)
 
 
@@ -247,6 +308,15 @@ print(f"\n  把 (b) 的 loss 按 token 类别拆开：")
 print(f"    visual 占位符 {int(is_img.sum()):4d} 个,  平均 loss = {per_tok[is_img].mean():.4f}")
 print(f"    答案 token    {int(is_ans.sum()):4d} 个,  平均 loss = {per_tok[is_ans].mean():.4f}")
 print(f"    其余模板 token{int(is_other.sum()):4d} 个,  平均 loss = {per_tok[is_other].mean():.4f}")
+
+# 这些位置上 CE 就是 -ln p(151655)，所以直接指数回去，看的是概率的几何平均。
+# （不用 softmax 是因为那会多出一个 (B, L, vocab) 的副本，白白吃几百 MB。）
+n_img_tok = int((ids2 == IMAGE_PAD_ID).sum())
+p_img = torch.exp(-per_tok[is_img].mean())
+print(f"\n  换成概率看（CE = -ln p，下面是几何平均）：")
+print(f"    模型在图像位置上给 id {IMAGE_PAD_ID} 的概率 "
+      f"≈ exp(-{per_tok[is_img].mean():.1f}) = {p_img:.1e}")
+
 print(f"""
   这个结果和直觉相反，值得停下来看一眼。
 
@@ -254,16 +324,61 @@ print(f"""
   只是白白稀释信号"。实测是 {per_tok[is_img].mean():.1f} —— 高得离谱，比答案 token
   ({per_tok[is_ans].mean():.2f}) 高了一个数量级。
 
-  原因：<|image_pad|> 这个 id 在真实训练里**从来不是输出目标**。前向时那些位置的
-  hidden state 早就被 vision tower 的图像特征替换掉了，lm_head 在这些位置上吐的是
-  和图像内容相关的分布，压根不会把概率给 151655 这个占位符 id。
-  强行拿它当标签，等于在问一个模型从没被训练过的问题。
+  ---------- 为什么猜反了：得进 forward 里看 ----------
+
+  关键在于 <|image_pad|> **不是一个"词"，是一个坐标**。
+  transformers 5.4.0，`models/qwen2_vl/modeling_qwen2_vl.py` 约 1256-1264 行：
+
+      inputs_embeds = self.get_input_embeddings()(input_ids)
+      #   -> image 段拿到 embedding 表里 {IMAGE_PAD_ID} 那一行，{n_img_tok} 行一模一样
+
+      image_embeds  = self.get_image_features(pixel_values, image_grid_thw).pooler_output
+      #   -> vision tower 输出 {n_img_tok} x hidden
+
+      inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+      #   -> 这 {n_img_tok} 行被**整体覆盖**
+
+  embedding[{IMAGE_PAD_ID}] 这个向量在前向里活了不到一层就被扔了。id {IMAGE_PAD_ID}
+  的唯一作用是给 masked_scatter 提供一个布尔索引 —— 它是"图像特征贴在这儿"的
+  坐标标记，不承载任何内容。
+
+  所以直觉错在哪：以为一长串相同的 token 是个"复读任务"。复读的前提是模型能从
+  hidden state 里看出"我在图像区里"。**它看不出来** —— 那些位置的 embedding 已经
+  被覆盖，里面只有图像内容，没有"我是 image_pad"这个信息。对模型来说这不是复读，
+  是一道从没见过的题。上面 p ≈ {p_img:.0e} 就是这个意思：预训练从没让它
+  往这个 id 上放过概率。
+
+  ---------- 梯度方向为什么是反的 ----------
+
+  这些位置的 hidden state h 装的是 vision tower 对某个 patch 的编码经过若干层 LM
+  之后的产物，携带的是"这块像素是什么"。预训练已经把它对齐到语义空间 ——
+  lm_head 在这里吐的是跟图像内容相关的词分布，**这就是"图文对齐"的定义**。
+
+  而 lm_head 的第 {IMAGE_PAD_ID} 行，在整个预训练里从来没当过正样本，只当过负样本，
+  被持续推离一切真实语义方向。现在强行加一个 CE：
+
+      dL/dh = (softmax(logits) - onehot({IMAGE_PAD_ID})) @ W_out
+
+  这个梯度把 h 往 lm_head[{IMAGE_PAD_ID}] 那一行拽 —— 把"这块像素是什么"的表示，
+  往"我是个占位符"的方向拽。而 h 是从 vision tower + merger 传上来的，
+  只要视觉侧没冻，梯度一路回传，**直接破坏视觉特征本身**。
 
   所以 (b) 的危害不是"数字好看但学得少"，而是**方向直接是错的**：
   {int(is_img.sum()) / int(valid.sum()):.0%} 的监督信号在逼模型从图像位置吐出 <|image_pad|>，
   梯度会去破坏图文对齐本身。真正想学的那 {int(is_ans.sum()) / int(valid.sum()):.0%} 反而被淹没。
 
   一句话：图像 token 不算 loss，不是优化，是正确性问题。
+
+  ---------- 一条可以直接套用的判据 ----------
+
+  以后任何 token 拿不准要不要进 loss，问一句：
+      **推理时这个 token 是模型自己吐出来的，还是外部喂进去的？**
+
+    外部喂的（system prompt / user 问题 / 图像占位符 / padding）-> 条件 -> -100
+    模型自己吐的（answer / <|im_end|>）                         -> 目标 -> 算 loss
+
+  <|image_pad|> 100% 是外部喂的，所以没有讨论余地。
+  这条判据顺带也解释了 prompt 段为什么要掩 —— 是同一个理由，不是两件事。
 """)
 
 
