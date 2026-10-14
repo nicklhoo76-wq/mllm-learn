@@ -35,13 +35,18 @@ mllm-learn/
     │   ├── 03_resolution.py   #   拧 min/max_pixels，看 token 数和注意力开销
     │   ├── 04_patchify.py     #   smart_resize / pixel_values / 上采样的细节
     │   └── 01_infer.py        #   加载 2B 权重，完整推理
-    └── day2/                  # 数据管线 + labels 掩码 + Trainer
-        ├── common.py          #   CaptionDataset / collate_fn / labels，01~04 共用
-        ├── 00_prepare_data.py #   拉 32 条真实 flickr30k 落盘（唯一需要联网）
-        ├── 01_dataset.py      #   Dataset + collate_fn，演示朴素做法为什么崩
-        ├── 02_labels.py       #   labels 怎么掩、掩错会怎样
-        ├── 03_train_tiny.py   #   迷你随机模型跑通 Trainer 全流程
-        └── 04_train_2b.py     #   真 2B 冻结微调 6 步，拿真实时间/内存
+    ├── day2/                  # 数据管线 + labels 掩码 + Trainer
+    │   ├── common.py          #   CaptionDataset / collate_fn / labels，01~04 共用
+    │   ├── 00_prepare_data.py #   拉 32 条真实 flickr30k 落盘（唯一需要联网）
+    │   ├── 01_dataset.py      #   Dataset + collate_fn，演示朴素做法为什么崩
+    │   ├── 02_labels.py       #   labels 怎么掩、掩错会怎样
+    │   ├── 03_train_tiny.py   #   迷你随机模型跑通 Trainer 全流程
+    │   └── 04_train_2b.py     #   真 2B 冻结微调 6 步，拿真实时间/内存
+    └── day3/                  # PEFT / LoRA + datasets.map()
+        ├── 01_lora_dissect.py #   LoRA 插在哪、r/alpha 分别管什么
+        ├── 02_lora_vision.py  #   target_modules 要不要盖 vision/merger
+        ├── 03_compare_train.py#   全量/冻结最后一层/LoRA 三方实测对照
+        └── 04_datasets_map.py #   .map() 预计算 vs collate 现算，边界在哪；含 prompt_len 优化落地验证
 ```
 
 脚本编号就是**建议的阅读和运行顺序**（day1 的 `01_infer.py` 最费时间，放最后跑）。
@@ -93,6 +98,12 @@ HF_HUB_OFFLINE=1 ./.venv/Scripts/python.exe -u week1/day2/01_dataset.py
 HF_HUB_OFFLINE=1 ./.venv/Scripts/python.exe -u week1/day2/02_labels.py
 HF_HUB_OFFLINE=1 ./.venv/Scripts/python.exe -u week1/day2/03_train_tiny.py
 HF_HUB_OFFLINE=1 ./.venv/Scripts/python.exe -u week1/day2/04_train_2b.py
+
+# Day 3：全离线，peft 需先 pip install
+HF_HUB_OFFLINE=1 ./.venv/Scripts/python.exe -u week1/day3/01_lora_dissect.py
+HF_HUB_OFFLINE=1 ./.venv/Scripts/python.exe -u week1/day3/02_lora_vision.py
+HF_HUB_OFFLINE=1 ./.venv/Scripts/python.exe -u week1/day3/03_compare_train.py
+HF_HUB_OFFLINE=1 ./.venv/Scripts/python.exe -u week1/day3/04_datasets_map.py
 ```
 
 两个前缀不是装饰：
@@ -101,8 +112,8 @@ HF_HUB_OFFLINE=1 ./.venv/Scripts/python.exe -u week1/day2/04_train_2b.py
   每次都会去连镜像校验元数据，带宽被占满时连只读配置的脚本也能卡几分钟。
 - **`-u`** —— 关掉 stdout 缓冲，否则管道里看不到中间输出。
 
-`week1/day2/data/`、`out_tiny/`、`out_2b/`、`hf-cache/` 都是脚本产物，已 gitignore；
-克隆下来后按上面的顺序跑一遍即可重建。
+`week1/day2/data/`、`out_tiny/`、`out_2b/`、`out_lora/`、`hf-cache/` 都是脚本产物，
+已 gitignore；克隆下来后按上面的顺序跑一遍即可重建。
 
 ## 进度
 
@@ -110,8 +121,8 @@ HF_HUB_OFFLINE=1 ./.venv/Scripts/python.exe -u week1/day2/04_train_2b.py
 |---|---|---|---|
 | Week 1 · Day 1 | Transformers 推理链路 + Qwen2-VL 输入机制 | 完成 | [Day 1](notes.md#day-1---transformers-推理链路--qwen2-vl-输入机制) |
 | Week 1 · Day 2 | 数据管线 + labels 掩码 + Trainer | 完成 | [Day 2](notes.md#day-2---数据管线--labels-掩码--trainer) |
-| Week 1 · Day 4-5 | Datasets + PEFT / LoRA | 下一步 | |
-| Week 1 · Day 6-7 | LLaMA Factory | 待开始 | |
+| Week 1 · Day 4-5 | Datasets + PEFT / LoRA | 完成 | [Day 3](notes.md#day-3---peft--lora--datasetsmap) |
+| Week 1 · Day 6-7 | LLaMA Factory | 下一步 | |
 | Week 2 | 分布式训练：torchrun / Accelerate / DeepSpeed ZeRO | 待开始 | |
 | Week 3 | DeepSpeed 进阶 / TRL / vLLM | 待开始 | |
 | Week 4 | VLMEvalKit / lmms-eval / 综合实战 | 待开始 | |
@@ -126,3 +137,9 @@ HF_HUB_OFFLINE=1 ./.venv/Scripts/python.exe -u week1/day2/04_train_2b.py
   = 32.9GB，还没算激活。
 - **冻结要从底往上冻。** 只解冻最后 k 层，前面几层等同于推理、算完即弃，省下的不只是
   优化器状态，还有激活内存。
+- **LoRA 的 `alpha` 管的是旁路相对主干的影响力，不是模型总输出的量级。** 直接量整个
+  layer 的输出看不出 `alpha` 的线性效应（被冻结的主干权重淹没），得把旁路增量单独
+  抠出来量才对得上。
+- **可训练参数量的优势不等于内存优势——除非优化器状态本身就是瓶颈。** LoRA 比冻结
+  最后一层的可训练参数少 43 倍，但这台 CPU 机器的 RSS 峰值几乎没差，因为瓶颈是
+  8.2GB 的权重本身，不是优化器状态。LoRA 真正的收益要等显存吃紧的 GPU 场景才显出来。

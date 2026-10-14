@@ -526,3 +526,214 @@ Day 2 的四条全部做完。下一步按计划书是 Day 4-5（Datasets + PEFT
 - [ ] 多模态特有的问题：`target_modules` 要不要包含 vision tower？merger 呢？
 - [ ] `datasets` 的 `.map()` 做预处理 vs 我们现在的"collate 里现算"，各自的取舍
       （现在每个 batch 都要为算 prompt_len 多过一次 processor，是笔明显的浪费）
+
+## Day 3 - PEFT / LoRA + datasets.map()
+
+日期：2026-09-24
+
+### 今日学习内容
+
+- 理论：LoRA 的旁路矩阵插在哪、`r`/`alpha`/`target_modules` 分别管什么；
+  多模态模型 target_modules 要不要覆盖 vision tower / merger；
+  `datasets.map()` 预处理和 collate 里现算的边界在哪。
+- 实践：`week1/day3/` 四个脚本，在真 2B 权重上验证。
+
+| 脚本 | 作用 |
+|---|---|
+| `01_lora_dissect.py` | LoRA 插在哪、`r`/`alpha` 分别管什么 |
+| `02_lora_vision.py` | target_modules 要不要盖 vision attn / merger |
+| `03_compare_train.py` | 全量(算账) / 冻结最后一层(引用 Day2) / LoRA(实测) 三方对照 |
+| `04_datasets_map.py` | `.map()` 预计算 vs collate 现算，实测哪个更快、边界在哪；并把优化落到 `common.py`（预计算 `prompt_len`，collate 直读） |
+
+### 关键收获
+
+**1. target_modules 是按名字字符串匹配的，不是按语义——先把名字列全，再挑。**
+
+Qwen2-VL 里 Linear 层的命名两套体系互不相同：
+
+```
+LLM  attention : q_proj / k_proj / v_proj / o_proj   (28 层，各自独立)
+vision attention: qkv (合并 QKV) / proj (输出投影)     (32 层)
+LLM  mlp       : gate_proj / up_proj / down_proj      (28 层)
+vision mlp     : fc1 / fc2                            (32 层)
+merger         : mlp.0 / mlp.2                        (1 个，两层 Linear)
+patch_embed    : proj                                 (1 个，但是 Conv3d 不是 Linear)
+```
+
+两套名字完全不重叠，所以 `target_modules=["q_proj","v_proj"]` 天然只命中
+LLM，不会误伤 vision——但如果手滑写成 `target_modules=["proj"]`，会同时
+命中 vision attention 的输出投影（Linear，能用）和 `patch_embed.proj`
+（Conv3d，LoRA 未必支持），这种坑只能靠先 `named_modules()` 过一遍来避免，
+不能凭直觉猜。
+
+**2. 默认配置 (r=8, alpha=32, target=[q_proj,v_proj])：可训练参数比冻结最后一层还小一个数量级。**
+
+```
+LoRA        : 1,089,536 / 2,210,075,136 = 0.0493%
+冻结最后一层 : 47,000,000 / 2,205,000,000 = 2.12%   (Day 2 04)
+```
+
+差 43 倍的原因：冻结方案留下的是一整个 decoder block（attn+mlp 七个
+Linear 的全部参数）；LoRA 是在全部 28 层的 q_proj/v_proj 上各插一对
+`r=8` 的小矩阵，层数虽多，但每层新增参数 `= r*(in+out)`，比原矩阵
+`in*out` 小两个数量级。抓一层出来看形状对上了：`W (1536,1536)` 冻结，
+`lora_A (8,1536)` + `lora_B (1536,8)` 可训练，`lora_B` 初始化为全 0——
+训练第一步 `B@A=0`，模型初始输出和没套 LoRA 时完全一样，全靠梯度把
+`B` 从 0 推开，所以不需要额外 warmup。
+
+**3. `r` 线性决定参数量，`alpha` 只决定旁路相对主干的影响力——不是模型总输出的量级。**
+
+扫 `r ∈ {4,8,16,32}`（固定 alpha=32）：
+
+```
+r= 4 : 0.54M  (1.00x)
+r= 8 : 1.09M  (2.00x)
+r=16 : 2.18M  (4.00x)
+r=32 : 4.36M  (8.00x)
+```
+
+完全线性，符合 `r*(in+out)` 的公式。
+
+`alpha` 这条**猜错了一次**：最初以为"alpha 翻倍，输出范数也该翻倍"，
+直接量整个 layer 的输出（`Wx + scaling*BAx`）验证，发现 alpha 从 8 涨到
+64（8 倍），完整输出范数只从 282.16 涨到 282.69——几乎不动。原因是
+冻结分支 `Wx` 的范数（282.20）占绝对大头，`alpha` 只能线性放大旁路那一项
+（初始化很小），压不过主干。把旁路单独抠出来（`完整输出 - 冻结分支输出`）
+才是线性的：alpha 8→64，旁路范数从 2.90 精确涨到 23.17，正好 8 倍。
+
+> 判据以后可以直接用：**alpha 控制的是旁路相对主干的影响力，不是模型
+> 总输出的量级**。这也是常见经验"alpha 通常设成 r 的 2~4 倍"的来源——
+> `alpha/r` 太小，旁路更新会被稀释到不起作用；太大又会让训练初期
+> （B 刚离开 0）步子过猛。
+
+**4. 多模态的 target_modules：该不该盖 vision/merger，看梯度范数，不是看参数量。**
+
+三种方案的可训练参数量（都在全模型的 0.05%~0.12% 量级，涨幅不明显）：
+
+```
+(a) 仅 LLM attn                : 1.090M  0.049%
+(b) (a) + vision attn(qkv)     : 2.400M  0.109%  (+1.31M)
+(c) (b) + merger                : 2.535M  0.115%  (+0.135M)
+```
+
+真正该看的是 Day 2「关键收获 2」测过的梯度范数：
+
+```
+vision patch_embed  2.77    text embed_tokens  2.99
+vision blocks        0.57    text layers        5.11
+vision merger         3.79
+```
+
+`vision blocks` 的梯度范数是全表最小的一档，`merger`（图文语义对齐真正
+发生的地方）和 `text layers` 才是大头。结论：默认只在 LLM attn 上挂
+LoRA（方案 a）是对的起点；真要扩，先扩 merger，不是整个 vision blocks——
+参数量不是决定因素（三种方案都很小），决定因素是"这层的梯度到底大不大"
+以及"vision 侧学崩了比 LLM 侧更难从 loss 曲线上诊断"（Day 2 的教训——
+图像 token 的 loss 本来就不该看，vision 侧出问题不会直接反映在 loss 数字上）。
+
+**5. 真机对照：可训练参数差 43 倍，但这台 CPU 机器的 RSS 峰值几乎没差。**
+
+跟 Day 2 04 完全同款设置（`STEPS=6`, batch=1, `MAX_PIXELS=64*28*28`）：
+
+```
+              可训练参数   占比    RSS峰值   单步耗时    loss区间
+全量(算账)     2205.0M    100%   32.9GB+     -         -(跑不了)
+冻结最后一层    47.0M     2.12%   9.0GB     5~13s     1.6~2.6
+LoRA(本次)      1.1M     0.05%   8.5GB     6~28s     1.6~2.6
+```
+
+反直觉的一点：可训练参数差 43 倍，RSS 峰值只差 0.5GB。原因是这台机器的
+瓶颈从 Day 2 04 就确认过是**权重本身**（8.2GB，mmap 换页），两种方案
+共享同一份权重，谁都绕不过去；优化器状态的差距（LoRA 的 Adam 状态只要
+8MB，冻结方案要 359MB）相对 8.2GB 权重是纯粹的零头，不会体现在 RSS
+数字上。LoRA 真正的收益点是**显存是瓶颈的场景**（GPU 训练，优化器状态
+直接占显存）——这台 CPU 机器天生测不出来，只能算账：`1.1M * 8B = 8MB`
+vs `47M * 8B = 359MB`，账是对的，只是这台机器的短板不在这上面。
+
+**6. `datasets.map()` 预处理：省的是"以后不用重算"，不是"这一遍算得更快"。**
+
+这条也**猜错了一次**：以为 `.map()` 和手写循环做的是同一件事（调用同一个
+`processor(...)`），耗时该差不多。实测 32 条样本：
+
+```
+手写循环现算一遍     : 0.42s
+.map() 预计算一遍    : 1.47s   (慢 3.5 倍)
+```
+
+`.map()` 自己有开销——逐条把返回的 dict 写回 Arrow 表、做类型推断，
+这些对"32 条这种小数据集 + 单条很便宜的函数"来说，开销占比反而比真正
+在算的东西还显眼。但 `.map()` 只用付一次，手写循环是每个 epoch 都要付：
+收支平衡点在约 3.5 个 epoch，Day 2 04 只跑了 6 步（不到一个 epoch），
+这笔账当时确实不明显，训练时长一旦远超平衡点就会翻过来。
+
+**边界**：能塞进 `.map()` 的只是"单条样本自己就能定、不依赖同 batch 其它
+样本"的量——`prompt_len` 是这种量。`input_ids` 的 padding 长度和
+`pixel_values` 的拼接（Day 2 已验证过是拼接不是堆叠）天然是 batch 级
+决定，脱离 batch 谈"这条该 pad 成多长"没有意义，只能留在 `collate_fn`
+里。`.map()` 和 `collate_fn` 不是二选一，是同一条流水线的两段。
+
+**落地（`common.py` 已改，04 第 4 节验证）：**
+
+Day 2 `collate_fn` 里那句注释挑明的浪费——为了拿 `prompt_len`，对同一张图
+再多过一次 processor（`pixel_values` 算完就丢，只取 `input_ids.shape[1]`）——
+现在拆成三块：
+
+- `compute_prompt_len(processor, image)`：独立函数，仍然必须带图（不带图会短
+  一大截，见 Day 2 问题 2）。
+- `CaptionDataset.precompute_prompt_len(processor)`：训练前跑一遍，把结果写进
+  每条 record；`__getitem__` 有就带上 `prompt_len`。
+- `collate_fn`：样本带 `prompt_len` 就直读，没带才回退现算，所以 Day 2 的
+  01/02 脚本不用改。
+
+用的是**普通循环而不是 `.map()`**：repo 的 Dataset 是 torch 的，而且上面刚测
+过 `.map()` 在这个规模下反而慢 3.5 倍。实测（32 条，batch=4，8 个 batch）：
+
+```
+labels / input_ids 与优化前逐位一致 : True
+一个 epoch 的 collate 耗时   优化前 0.56s  ->  优化后 0.25s   (省 0.31s/epoch)
+预计算一次的代价             0.33s
+ 1 epoch : 0.56s vs 0.59s   净省 -0.02s   (持平)
+ 3 epoch : 1.69s vs 1.09s   净省  0.60s
+10 epoch : 5.65s vs 2.86s   净省  2.79s
+```
+
+平衡点从 `.map()` 的约 3.5 个 epoch 降到约 1 个：预计算的成本就是"现算那一遍"
+本身，没有 Arrow 写回的固定开销。绝对数字在 32 条的玩具规模下不值一提，
+**重点是方法**：样本级静态量提前算，batch 级动态量留在 collate。
+
+一个必须记住的约束：`prompt_len` 依赖 processor 的 `min_pixels`/`max_pixels`，
+所以**只缓存在内存里、不落盘**。换了分辨率配置就得重新 `precompute_prompt_len`，
+否则拿旧长度掩码，边界会静默偏移——又是一个不报错的坑（和 `padding_side` 同类）。
+训练脚本（Day 2 03/04、Day 3 03）暂时没接入，保持它们已记录的耗时数字可复现；
+要用时在建 `CaptionDataset()` 之后加一行 `ds.precompute_prompt_len(processor)`。
+
+### 遇到的问题
+
+**问题 1：`model.visual` 报 `AttributeError`。**
+
+01 里 `named_modules()` 打印出来的路径带 `model.visual...` 前缀，误以为
+`model.visual` 就能直接访问。实际上 `Qwen2VLForConditionalGeneration`
+自己是外层壳，视觉塔在 `model.model.visual`（`model.model` 才是
+`Qwen2VLModel`）。`named_modules()` 打印的路径是相对遍历起点的，起点是
+谁、路径就从谁算起，不能想当然按"去掉最外层类名"来猜属性链。
+
+**问题 2：alpha 缩放实验第一次量错了对象（见关键收获 3）。**
+
+量整个 layer 的输出而不是旁路的增量，会被冻结的主干权重完全淹没。
+教训是"要验证某个组件的效应，得把它的贡献从总输出里单独抠出来"，
+这条和 Day 2「不算 loss ≠ 不参与训练」是同一类坑——都是"直接量总量
+看不出组件效应"。
+
+### 明日计划
+
+Day 3 的五条全部做完，`week1/day3/` 四个脚本可复现。下一步按计划书是
+Day 6-7（LLaMA Factory）——用配置文件驱动同样的 LoRA 微调，跟今天手写的
+`peft.LoraConfig` 版本对比，看工具化训练省了哪些代码、又在哪些地方把
+今天摸清楚的细节（labels 掩码、target_modules 选择）藏进了配置项背后。
+
+- [ ] 装 LLaMA Factory，先跑通一个官方 example（不用 Qwen2-VL，验证环境）
+- [ ] 用 YAML 配置复现 Day 2+3 的 caption 微调任务
+- [ ] 对比：配置文件里的 `lora_target` 参数，默认值和今天选的
+      `[q_proj, v_proj]` 是否一致，`template: qwen2_vl` 具体做了哪些
+      我们在 `common.py` 里手写的事（`apply_chat_template`、labels 掩码）
+- [ ] 记录工具化训练相对手写代码，在可控性上让出了什么、换回了什么

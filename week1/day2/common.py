@@ -41,7 +41,35 @@ class CaptionDataset(Dataset):
         r = self.records[idx]
         # 懒加载：只在真正取到这条时才开图，省内存
         image = Image.open(os.path.join(self.root, r["image"])).convert("RGB")
-        return {"image": image, "answer": r["caption"]}
+        item = {"image": image, "answer": r["caption"]}
+        if "prompt_len" in r:
+            item["prompt_len"] = r["prompt_len"]
+        return item
+
+    def precompute_prompt_len(self, processor):
+        """训练前一次性算好每条的 prompt_len，collate_fn 之后直接读，不再重算。
+
+        prompt_len 只取决于"这张图 + 固定指令"，和 batch、epoch 都无关，属于样本级静态量
+        （Day 3 04）。结果依赖 processor 的 min_pixels/max_pixels，所以只缓存在内存里、
+        不落盘——换了分辨率配置必须重新调用，落盘缓存会悄悄过期。
+        用普通循环而不是 datasets.map()：本 repo 的 Dataset 是 torch 的，且 04 实测
+        32 条规模下 .map() 的 Arrow 写回开销比循环慢 3.5 倍。
+        """
+        for r in self.records:
+            image = Image.open(os.path.join(self.root, r["image"])).convert("RGB")
+            r["prompt_len"] = compute_prompt_len(processor, image)
+        return self
+
+
+def compute_prompt_len(processor, image):
+    """prompt（含图片展开后的 visual token）占多少个 token。
+
+    必须带着图去 tokenize：<|image_pad|> 在文本里只有 1 个 token，processor 见到真图
+    算出 grid 之后才会展开成几百个，不传图算出来的长度会短一大截。
+    """
+    prompt_text, _ = build_texts(processor, answer=None)
+    ids = processor(text=[prompt_text], images=[image], return_tensors="pt")["input_ids"]
+    return ids.shape[1]
 
 
 def build_texts(processor, answer=None):
@@ -91,24 +119,20 @@ def make_collate_fn(processor, padding_side="right"):
 
     def collate_fn(batch):
         images = [b["image"] for b in batch]
-        prompts, fulls = [], []
-        for b in batch:
-            p, f = build_texts(processor, b["answer"])
-            prompts.append(p)
-            fulls.append(f)
+        fulls = [build_texts(processor, b["answer"])[1] for b in batch]
 
         # ---- 1. 整批过 processor ----
         inputs = processor(
             text=fulls, images=images, padding=True, return_tensors="pt"
         )
 
-        # ---- 2. 算每条的 prompt 长度 ----
-        # 必须带着同一张图去 tokenize prompt，否则 <|image_pad|> 不会被展开成
-        # 真实的 visual token 数量，算出来的长度会短一大截。
-        prompt_lens = []
-        for p, img in zip(prompts, images):
-            ids = processor(text=[p], images=[img], return_tensors="pt")["input_ids"]
-            prompt_lens.append(ids.shape[1])
+        # ---- 2. 每条的 prompt 长度 ----
+        # 样本自带 prompt_len（ds.precompute_prompt_len 预算过）就直接用；
+        # 没有才回退现算——现算要对同一张图多过一次 processor，见 compute_prompt_len。
+        prompt_lens = [
+            b["prompt_len"] if "prompt_len" in b else compute_prompt_len(processor, img)
+            for b, img in zip(batch, images)
+        ]
 
         # ---- 3. 构造 labels ----
         labels = inputs["input_ids"].clone()
