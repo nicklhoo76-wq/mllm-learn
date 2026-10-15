@@ -42,11 +42,15 @@ mllm-learn/
     │   ├── 02_labels.py       #   labels 怎么掩、掩错会怎样
     │   ├── 03_train_tiny.py   #   迷你随机模型跑通 Trainer 全流程
     │   └── 04_train_2b.py     #   真 2B 冻结微调 6 步，拿真实时间/内存
-    └── day3/                  # PEFT / LoRA + datasets.map()
-        ├── 01_lora_dissect.py #   LoRA 插在哪、r/alpha 分别管什么
-        ├── 02_lora_vision.py  #   target_modules 要不要盖 vision/merger
-        ├── 03_compare_train.py#   全量/冻结最后一层/LoRA 三方实测对照
-        └── 04_datasets_map.py #   .map() 预计算 vs collate 现算，边界在哪；含 prompt_len 优化落地验证
+    ├── day3/                  # PEFT / LoRA + datasets.map()
+    │   ├── 01_lora_dissect.py #   LoRA 插在哪、r/alpha 分别管什么
+    │   ├── 02_lora_vision.py  #   target_modules 要不要盖 vision/merger
+    │   ├── 03_compare_train.py#   全量/冻结最后一层/LoRA 三方实测对照
+    │   └── 04_datasets_map.py #   .map() 预计算 vs collate 现算，边界在哪；含 prompt_len 优化落地验证
+    └── day4/                  # LLaMA Factory：YAML 复现同一个 LoRA 任务
+        ├── 00_convert_data.py #   Day 2 的 jsonl -> LF 的 sharegpt 多模态格式
+        ├── qwen2vl_lora.yaml  #   对齐手写版的配置（r/alpha/target/分辨率/步数）
+        └── 01_compare_labels.py#  LF 数据管线 vs 手写 common.py，逐位对照 input_ids/labels
 ```
 
 脚本编号就是**建议的阅读和运行顺序**（day1 的 `01_infer.py` 最费时间，放最后跑）。
@@ -104,6 +108,13 @@ HF_HUB_OFFLINE=1 ./.venv/Scripts/python.exe -u week1/day3/01_lora_dissect.py
 HF_HUB_OFFLINE=1 ./.venv/Scripts/python.exe -u week1/day3/02_lora_vision.py
 HF_HUB_OFFLINE=1 ./.venv/Scripts/python.exe -u week1/day3/03_compare_train.py
 HF_HUB_OFFLINE=1 ./.venv/Scripts/python.exe -u week1/day3/04_datasets_map.py
+
+# Day 4：用 .venv-lf（LLaMA Factory 0.9.6.dev0，pip install -e 安装）。
+# 纯 CPU 需先把 LLaMA-Factory/src/llamafactory/model/loader.py:160 的 torch_dtype
+# 改成「无加速器时 float32」，否则基座按 bf16 加载，每步慢 ~80 倍（见 notes.md Day 4）
+./.venv/Scripts/python.exe week1/day4/00_convert_data.py
+HF_HOME="$PWD/hf-cache" HF_HUB_OFFLINE=1 ./.venv-lf/Scripts/llamafactory-cli.exe train week1/day4/qwen2vl_lora.yaml
+HF_HUB_OFFLINE=1 ./.venv-lf/Scripts/python.exe -u week1/day4/01_compare_labels.py
 ```
 
 两个前缀不是装饰：
@@ -122,8 +133,8 @@ HF_HUB_OFFLINE=1 ./.venv/Scripts/python.exe -u week1/day3/04_datasets_map.py
 | Week 1 · Day 1 | Transformers 推理链路 + Qwen2-VL 输入机制 | 完成 | [Day 1](notes.md#day-1---transformers-推理链路--qwen2-vl-输入机制) |
 | Week 1 · Day 2 | 数据管线 + labels 掩码 + Trainer | 完成 | [Day 2](notes.md#day-2---数据管线--labels-掩码--trainer) |
 | Week 1 · Day 4-5 | Datasets + PEFT / LoRA | 完成 | [Day 3](notes.md#day-3---peft--lora--datasetsmap) |
-| Week 1 · Day 6-7 | LLaMA Factory | 下一步 | |
-| Week 2 | 分布式训练：torchrun / Accelerate / DeepSpeed ZeRO | 待开始 | |
+| Week 1 · Day 6-7（第 4 天） | LLaMA Factory | 完成 | [Day 4](notes.md#day-4---llama-factory-工具化复现-caption-微调) |
+| Week 2 | 分布式训练：torchrun / Accelerate / DeepSpeed ZeRO | 下一步 | |
 | Week 3 | DeepSpeed 进阶 / TRL / vLLM | 待开始 | |
 | Week 4 | VLMEvalKit / lmms-eval / 综合实战 | 待开始 | |
 
@@ -143,3 +154,7 @@ HF_HUB_OFFLINE=1 ./.venv/Scripts/python.exe -u week1/day3/04_datasets_map.py
 - **可训练参数量的优势不等于内存优势——除非优化器状态本身就是瓶颈。** LoRA 比冻结
   最后一层的可训练参数少 43 倍，但这台 CPU 机器的 RSS 峰值几乎没差，因为瓶颈是
   8.2GB 的权重本身，不是优化器状态。LoRA 真正的收益要等显存吃紧的 GPU 场景才显出来。
+- **工具化最大的暗坑是默认值，而且有些没有配置项能改。** LLaMA Factory 在纯 CPU 上把基座按
+  config 里的 bf16 加载（`loader.py:160`），每步 ~2400s，改成 fp32 后 ~30s；两次 loss 几乎
+  重合，只看 loss 发现不了。`template: qwen2_vl` 本身没问题：去掉图像 token 后文本逐位和
+  手写版一致（32/32），但两边缩图规则不同，visual token 数 60~63 vs 54。

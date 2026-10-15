@@ -1,0 +1,46 @@
+# 参数名已对照 LLaMA-Factory/src/llamafactory/hparams 核对过。
+# 刻意和 Day 2/3 手写版对齐：LoRA r=8 / alpha=32 / q_proj,v_proj，同一句指令，
+# image_max_pixels=64*28*28=50176。
+# 注意：LF 的 lora_alpha 默认是 rank*2=16，lora_target 默认是 all，这里都显式覆盖成 Day 3 的值。
+
+### model
+model_name_or_path: Qwen/Qwen2-VL-2B-Instruct
+image_max_pixels: 50176
+image_min_pixels: 3136          # 默认 32*32=1024；取 56*56，贴近 HF processor 的 min_pixels 量级
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 8
+lora_alpha: 32
+lora_dropout: 0.0
+lora_target: q_proj,v_proj
+freeze_vision_tower: true            # 默认即 true，显式写出，对应 Day 3 方案 (a)
+freeze_multi_modal_projector: true   # 默认即 true
+
+### dataset
+dataset: flickr30k_caption
+dataset_dir: week1/day4/data
+template: qwen2_vl
+cutoff_len: 1024
+max_samples: 32
+preprocessing_num_workers: 1
+train_on_prompt: false               # 默认 false：prompt（含图像占位符）labels 全为 -100
+
+### output
+output_dir: week1/day4/output/qwen2vl_lora
+logging_steps: 1
+save_steps: 1000
+plot_loss: true
+report_to: none
+
+### train（CPU 机器：只跑几步验证链路）
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 5.0e-5
+max_steps: 6
+lr_scheduler_type: cosine
+bf16: false
+fp16: false

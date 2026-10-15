@@ -477,6 +477,8 @@ q/k/v/o 四个投影，vision 合并成一个 `qkv`——差异来自两边的�
 | 7 | `remove_unused_columns` 默认 `True` | `RemoveColumnsCollator` 按 `model.forward` 签名把自定义 Dataset 的 key 裁光，collate 收到空 dict | 这个会 `KeyError`，算显式。正解：设 `False`（源码 `trainer.py:965-968`） |
 | 8 | 直接读 RSS | safetensors 是 mmap 进来的，页面没被读到就不计入，刚加载完可能只显示 0.3GB；内存紧张时换页导致单步耗时 5s↔40s 乱跳 | 跑几步等权重全部驻留再读（本机稳定 9.0GB） |
 | 9 | 量「组件的效应」时量了整个输出（LoRA `alpha`） | 旁路范数 2.90→23.17（8 倍，正确），完整输出范数 282.16→282.69（几乎不动）——被冻结主干的 282.20 淹没 | 把组件贡献单独抠出来量：`完整输出 - 冻结分支输出`（Day 3 实测） |
+| 10 | LLaMA Factory 加载基座用 `torch_dtype="auto"`（`loader.py:160`） | 沿用模型 config 里的 bf16，纯 CPU 上没有快速路径：每步约 2400s，fp32 只要约 30s（差 ~80 倍）。**loss 数值完全正常**，只是慢；YAML 的 `bf16/fp16: false` 管不到它 | 看日志里 `Will use dtype=...` 那一行；日志里只有 `Upcasting trainable params to float32` 说明升的只是 LoRA 参数，基座没动 |
+| 11 | 两套管线各自缩图（LF 预缩放 + processor 四舍五入 vs 手写 processor 直接向下取整） | 同一张图 LF 60~63 个 visual token，手写 54 个；文本部分逐位一致，只有 `input_ids` 整体不等 | 去掉 `<|image_pad|>` 再比文本；再看 `processor.image_processor.size` 上限是谁设的（LF 的是默认 12845056，不是 `image_max_pixels`） |
 
 **通用原则**：多模态链路上，「不报错」不等于「对」。每加一环，先找一条能**当场证伪**的等式
 或对照（token 计数、decode 回读、理论 loss、把增量单独抠出来量），再往下走。
@@ -503,12 +505,41 @@ q/k/v/o 四个投影，vision 合并成一个 `qkv`——差异来自两边的�
 
 ---
 
+## 主线五：工具化训练换走了什么、藏起了什么
+
+用 LLaMA Factory 的一份 YAML 复现 Day 2/3 手写的同一个 caption 任务
+（`week1/day4/qwen2vl_lora.yaml`，r=8 / alpha=32 / `q_proj,v_proj`，同一句指令）。
+
+**换回来的：`common.py` 里手写的那堆事，一份配置就够。**
+`template: qwen2_vl` 替我们做了 `apply_chat_template`、prompt 段掩成 -100、padding 位掩码、
+`padding_side`。逐位对照（`01_compare_labels.py`，32 条）：去掉 `<|image_pad|>` 后文本 token
+**32/32 一致**，参与 loss 的恰好是答案 + `<|im_end|>\n`（第 0 条两边都是 21 个 token）。
+Day 2 一路踩的 labels 坑（主线四 #3、#4）在这里全都不用再自己防。
+
+**藏起来的：默认值。** 默认值不会报错，只会悄悄改变你实验的含义——YAML 里每一条有默认值的项
+都要问一句「它的默认值和我手写时选的一样吗」：
+
+| 默认值 | LF 默认 | 手写版 | 处理 |
+|---|---|---|---|
+| `lora_target` | `all`（全部 Linear） | `q_proj,v_proj` | YAML 显式覆盖 |
+| `lora_alpha` | `rank*2` = 16 | 32 | YAML 显式覆盖 |
+| 基座权重 dtype | config 里的 bf16（`torch_dtype="auto"`） | fp32 | **YAML 管不到**，改了 `loader.py:160`（见主线四 #10） |
+| 图像 token 数 | 先预缩放再四舍五入，60~63/张 | `max_pixels` 向下取整，54/张 | 不改，记下差异（主线四 #11） |
+| gradient checkpointing | 默认开 | 没开 | 不改；步耗时因此在 14~32s，落在 Day 3 的 6~28s 上沿 |
+
+**dtype 那一条最值得记：它是纯性能问题，loss 一点不错。** bf16 那次跑到第 5 步，loss 序列
+2.09/2.53/2.62/2.05/1.96 和 fp32 的 2.13/2.52/2.61/2.02/1.92 几乎重合，如果不看耗时，
+根本发现不了。这是主线四那张表的又一类：不是结果错，是**代价错**。
+
+**可控性的账：** 想改的东西只要 YAML 里有项就比手写便宜；没有项的（dtype、预缩放规则）
+就得读源码、改源码。工具化不是少写代码，是把「读哪里的源码」换成了「读哪份文档」。
+
+> 原始：[Day 4](notes.md#day-4---llama-factory-工具化复现-caption-微调)
+
+---
+
 ## 还没连起来的线头
 
-- **工具化把哪些细节藏进了配置项背后**：Day 6-7 用 LLaMA Factory 的 YAML 复现同一个
-  caption 任务，重点对照两处——它的 `lora_target` 默认值是不是 `[q_proj, v_proj]`，
-  以及 `template: qwen2_vl` 具体替我们做了 `common.py` 里手写的哪些事
-  （`apply_chat_template`、labels 掩码、`padding_side`）。
 - **显存吃紧的场景没实测过**：主线二第五层的「LoRA 真正的收益在 GPU」目前只有账，没有
   数字。这台 CPU 机器（瓶颈是权重 mmap）原则上测不出来，等 Week 2 的分布式部分看有没有
   机会换环境验证。

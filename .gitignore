@@ -1,6 +1,7 @@
 # --- 虚拟环境 ---
 .venv/
 venv/
+.venv-lf/
 
 # --- 模型/数据集缓存（HF_HOME，几个 GB，别进仓库）---
 hf-cache/
@@ -25,3 +26,8 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+
+LLaMA-Factory/
+# --- Day 4 产物（convert 脚本现生成，含绝对路径）---
+week1/day4/data/
+week1/day4/output/

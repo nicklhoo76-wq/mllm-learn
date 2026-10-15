@@ -737,3 +737,116 @@ Day 6-7（LLaMA Factory）——用配置文件驱动同样的 LoRA 微调，跟
       `[q_proj, v_proj]` 是否一致，`template: qwen2_vl` 具体做了哪些
       我们在 `common.py` 里手写的事（`apply_chat_template`、labels 掩码）
 - [ ] 记录工具化训练相对手写代码，在可控性上让出了什么、换回了什么
+
+---
+
+## Day 4 - LLaMA Factory 工具化复现 caption 微调
+
+日期：2026-10-15（计划书的 Day 6-7）
+
+### 今日学习内容
+
+- 理论：LLaMA Factory 的 YAML 驱动训练流程；`template: qwen2_vl` 替手写代码做了哪些事；
+  哪些默认值会悄悄改变实验的含义。
+- 实践：`week1/day4/`，用 YAML 复现 Day 2/3 的同一个 LoRA caption 任务。
+
+| 文件 | 作用 |
+|---|---|
+| `00_convert_data.py` | Day 2 的 `train.jsonl` → LF 的 sharegpt 多模态格式（`<image>` 占位符 + `images` 列表），复用 Day 2 的 `INSTRUCTION` 保证 prompt 一致 |
+| `qwen2vl_lora.yaml` | 对齐手写版：r=8 / alpha=32 / `q_proj,v_proj` / `max_pixels=64*28*28` / 6 步 |
+| `01_compare_labels.py` | 同一批 32 条，LF 数据管线 vs 手写 `common.py`，逐位对照 `input_ids` 和 `labels` |
+
+运行：`llamafactory-cli train week1/day4/qwen2vl_lora.yaml`（用 `.venv-lf`，LLaMA Factory 0.9.6.dev0，editable 安装）。
+
+### 关键收获
+
+**1. 第一次跑：每步约 40 分钟，原因是 bf16，不是别的。**
+
+日志看起来一切正常，loss 也在合理区间（2.09 / 2.53 / 2.62 / 2.05 / 1.96），就是慢：第 1 步 2329s，
+Day 3 手写版是 6~28s。（中间第 2 步前多出约 9 小时是机器睡眠，和训练无关。）
+
+定位过程：日志里 `Will use dtype=torch.bfloat16 as defined in model's config object`，
+同时只有 `Upcasting trainable params to float32`——升到 fp32 的只是 LoRA 参数，冻结的基座
+还是 bf16。源码 `model/loader.py:160` 写死 `init_kwargs["torch_dtype"] = "auto"`，沿用 config。
+YAML 里的 `bf16: false` / `fp16: false` 只是关混合精度，管不到权重加载精度；`infer_dtype`
+只对非训练场景生效。**这个 LF 没有提供配置项。**
+
+修法：`loader.py:160` 改成「没有加速器时用 `torch.float32`，否则 `"auto"`」（一行 + 一处 import，
+`LLaMA-Factory/` 在仓库里是 untracked，改动不进 git，记在这里）。先 `max_steps=2` 验证，再跑全量：
+
+```
+                bf16(改前)     fp32(改后)
+第 1 步         2329s          55s(含预热)
+稳态每步        ~2400s         14~32s
+6 步总耗时      -(没跑完)      2m47s(平均 28s/步)
+loss            2.09/2.53/2.62/2.05/1.96   2.13/2.52/2.61/2.02/1.92/2.10
+```
+
+两次 loss 几乎重合，所以**这是个只看 loss 发现不了的坑**——代价错了，结果没错。
+
+**2. `template: qwen2_vl` 的行为和手写版等价，labels 掩码不用自己再防了。**
+
+`01_compare_labels.py`，32 条：去掉 `<|image_pad|>` 后文本 token **32/32 逐位一致**；
+第 0 条参与 loss 的都是 21 个 token，解码出来都是
+`'Two young guys ... in the yard .<|im_end|>\n'`。也就是说 prompt 段全掩、答案 + `<|im_end|>\n`
+算 loss，和 Day 2 `common.py` 的边界完全相同。
+
+**3. 但 `input_ids` 整体不等：32 条里只有 1 条逐位一致，原因是图像 token 数不同。**
+
+```
+原图(298,448): LF 预缩放(182,274) -> grid[1,20,12] -> 60 tok | 手写 grid[1,18,12] -> 54 tok
+原图(448,335): LF 预缩放(259,193) -> grid[1,14,18] -> 63 tok | 手写 grid[1,12,18] -> 54 tok
+```
+
+手写版每张都是 54，LF 是 60~63 且随图变化（序列长 103 vs 109、97 vs 106 ……）。来源：
+
+- **手写版**：`max_pixels=50176` 直接交给 processor，smart_resize 把每条边**向下取整**到 28 的倍数。
+- **LF**：`image_max_pixels` 只用在它自己的 `_preprocess_image`（先把面积缩到 ≤ 50176，
+  `mm_plugin.py:220`）。processor 的 `longest_edge` 是默认的 12845056（打印确认），
+  所以 processor 只做**四舍五入**到 28 的倍数，上限不起作用。
+
+两边都没超出 50176 像素的预算（最大 63×784=49392），LF 只是多出 11%~17% 的 visual token。
+`image_min_pixels` 手写版取 3136 或 25088 结果相同（图都被 max 约束住了），不是差异来源。
+
+**4. 默认值是工具化最大的暗坑。**
+
+| 默认值 | LF 默认 | 手写 | 处理 |
+|---|---|---|---|
+| `lora_target` | `all` | `q_proj,v_proj` | YAML 显式覆盖 |
+| `lora_alpha` | `rank*2`=16 | 32 | YAML 显式覆盖 |
+| 基座 dtype | bf16（config） | fp32 | 改源码 |
+| 图像 token | 预缩放+四舍五入 | 向下取整 | 记录差异，不改 |
+| gradient checkpointing | 默认开 | 没开 | 不改 |
+
+可训练参数量和 Day 3 完全一致：`1,089,536 / 2,210,075,136 = 0.0493%`（日志原文），
+说明 `lora_target` / `lora_rank` 的显式覆盖生效了。若漏掉 `lora_target`，默认是 `all`
+（`finetuning_args.py:82`，所有 Linear），那就不是同一个实验了（没有实测具体多多少）。
+
+**5. 工具化换走的和藏起的。** 换走：`apply_chat_template`、labels 掩码、`padding_side`、
+Trainer 样板，一份 YAML 全包。藏起：dtype、预缩放规则、checkpointing 这类**没有对应配置项**
+的行为——想改就得读/改源码。工具化不是少写代码，是把「读哪里的源码」换成「读哪份文档」。
+
+### 遇到的问题
+
+**问题 1：训练每步 40 分钟。** 见关键收获 1。排查顺序：先确认进程还活着、loss 正常（排除崩溃）→
+看日志里的 dtype 行 → 读 `loader.py` / `patcher.py` 确认没有配置项能改 → 改源码、`max_steps=2` 对照。
+
+**问题 2：对照脚本第一次只看到 1/32 一致，差点误判成 labels 掩码不一致。**
+直接比 `input_ids` 会被图像 token 数淹没。去掉 `<|image_pad|>` 只比文本部分才是正确的粒度——
+和 Day 3 「要验证组件的效应，得把它的贡献单独抠出来」是同一类坑。
+
+**问题 3：为了读 `image_grid_thw` 写的临时脚本里 `__file__` 指向了临时目录**，`HERE`/`ROOT`
+推导全错，报 `No module named 'common'`。又一次「路径从 `__file__` 推导」的代价（见 README 环境一节）。
+
+### 没做的
+
+- 没有量 LF 版的 RSS 峰值，所以没法和 Day 3 的 8.5GB 对照。
+- gradient checkpointing 对步耗时的影响只是推断（LF 14~32s，Day 3 6~28s，落在上沿），没有关掉重跑验证。
+
+### 明日计划
+
+按计划书进入 Week 2：分布式训练基础（数据并行 / 模型并行 / 梯度累积 / 混合精度 / DDP）。
+
+- [ ] 读 HF 分布式训练指南，写清数据并行、ZeRO 三阶段各分片了什么
+- [ ] 手算：2.21B 模型在 fp32 AdamW 下，ZeRO-1/2/3 在 N 卡上每卡的权重/梯度/优化器状态各占多少
+- [ ] 回头验证今天的遗留项：LF 的 RSS 峰值、关掉 gradient checkpointing 的步耗时
