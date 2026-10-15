@@ -110,8 +110,9 @@ HF_HUB_OFFLINE=1 ./.venv/Scripts/python.exe -u week1/day3/03_compare_train.py
 HF_HUB_OFFLINE=1 ./.venv/Scripts/python.exe -u week1/day3/04_datasets_map.py
 
 # Day 4：用 .venv-lf（LLaMA Factory 0.9.6.dev0，pip install -e 安装）。
-# 纯 CPU 需先把 LLaMA-Factory/src/llamafactory/model/loader.py:160 的 torch_dtype
-# 改成「无加速器时 float32」，否则基座按 bf16 加载，每步慢 ~80 倍（见 notes.md Day 4）
+# 纯 CPU 需先打 patch（loader.py 的 torch_dtype 改成「无加速器时 float32」），
+# 否则基座按 bf16 加载，每步慢 ~80 倍（见 notes.md Day 4）：
+git -C LLaMA-Factory apply ../week1/day4/patches/0001-cpu-fp32-loader.patch
 ./.venv/Scripts/python.exe week1/day4/00_convert_data.py
 HF_HOME="$PWD/hf-cache" HF_HUB_OFFLINE=1 ./.venv-lf/Scripts/llamafactory-cli.exe train week1/day4/qwen2vl_lora.yaml
 HF_HUB_OFFLINE=1 ./.venv-lf/Scripts/python.exe -u week1/day4/01_compare_labels.py

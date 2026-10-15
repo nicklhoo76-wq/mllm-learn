@@ -1,0 +1,45 @@
+From 4f76ced99dfcce67d029d5db59c89c944a62c667 Mon Sep 17 00:00:00 2001
+From: nicklhoo76 <nicklhoo76@gmail.com>
+Date: Thu, 15 Oct 2026 18:29:09 +0800
+Subject: [PATCH] [model] load base weights in fp32 on CPU-only machines
+
+torch_dtype="auto" keeps the dtype from the model config (bf16 for Qwen2-VL).
+CPU has no fast bf16 matmul path, so training is ~80x slower than fp32
+(~2400s/step vs ~30s/step for Qwen2-VL-2B LoRA, with identical loss).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/llamafactory/model/loader.py | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/llamafactory/model/loader.py b/src/llamafactory/model/loader.py
+index b162c88..2e13bac 100644
+--- a/src/llamafactory/model/loader.py
++++ b/src/llamafactory/model/loader.py
+@@ -28,7 +28,12 @@ from transformers import (
+ from trl import AutoModelForCausalLMWithValueHead
+ 
+ from ..extras import logging
+-from ..extras.misc import count_parameters, skip_check_imports, try_download_model_from_other_hub
++from ..extras.misc import (
++    count_parameters,
++    is_accelerator_available,
++    skip_check_imports,
++    try_download_model_from_other_hub,
++)
+ from ..extras.packages import is_torch_version_greater_than
+ from .adapter import init_adapter
+ from .model_utils.liger_kernel import apply_liger_kernel
+@@ -157,7 +162,8 @@ def load_model(
+     if model is None:
+         init_kwargs["config"] = config
+         init_kwargs["pretrained_model_name_or_path"] = model_args.model_name_or_path
+-        init_kwargs["torch_dtype"] = "auto"
++        # CPU has no fast bf16 matmul path: "auto" would keep the bf16 weights from the model config and be ~100x slower
++        init_kwargs["torch_dtype"] = "auto" if is_accelerator_available() else torch.float32
+ 
+         if model_args.mixture_of_depths == "load":
+             model = load_mod_pretrained_model(**init_kwargs)
+-- 
+2.53.0.windows.2
+

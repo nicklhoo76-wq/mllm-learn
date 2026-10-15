@@ -773,8 +773,10 @@ YAML 里的 `bf16: false` / `fp16: false` 只是关混合精度，管不到权�
 
 修法：`loader.py:160` 改成「没有加速器时用 `torch.float32`，否则 `"auto"`」（改了 `torch_dtype` 一行 +
 `is_accelerator_available` 的 import，共 +8/-2 行）。`LLaMA-Factory/` 本身是独立的 git 仓库，
-外层仓库 gitignore 了它，所以这处改动只在内层仓库里以未提交修改的形式存在：
-`git -C LLaMA-Factory diff` 可以随时看到。先 `max_steps=2` 验证，再跑全量：
+外层仓库 gitignore 了它，所以改动另存为 patch：
+`week1/day4/patches/0001-cpu-fp32-loader.patch`（基于上游 `1fded91`，已验证能干净应用；
+内层仓库里同样有本地分支 `cpu-fp32-loader`，提交 `4f76ced`）。
+重装或换机器后复原：`git -C LLaMA-Factory apply ../week1/day4/patches/0001-cpu-fp32-loader.patch`。先 `max_steps=2` 验证，再跑全量：
 
 ```
                 bf16(改前)     fp32(改后)
