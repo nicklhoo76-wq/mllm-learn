@@ -771,8 +771,10 @@ Day 3 手写版是 6~28s。（中间第 2 步前多出约 9 小时是机器睡�
 YAML 里的 `bf16: false` / `fp16: false` 只是关混合精度，管不到权重加载精度；`infer_dtype`
 只对非训练场景生效。**这个 LF 没有提供配置项。**
 
-修法：`loader.py:160` 改成「没有加速器时用 `torch.float32`，否则 `"auto"`」（一行 + 一处 import，
-`LLaMA-Factory/` 在仓库里是 untracked，改动不进 git，记在这里）。先 `max_steps=2` 验证，再跑全量：
+修法：`loader.py:160` 改成「没有加速器时用 `torch.float32`，否则 `"auto"`」（改了 `torch_dtype` 一行 +
+`is_accelerator_available` 的 import，共 +8/-2 行）。`LLaMA-Factory/` 本身是独立的 git 仓库，
+外层仓库 gitignore 了它，所以这处改动只在内层仓库里以未提交修改的形式存在：
+`git -C LLaMA-Factory diff` 可以随时看到。先 `max_steps=2` 验证，再跑全量：
 
 ```
                 bf16(改前)     fp32(改后)
